@@ -1,0 +1,28 @@
+{
+	"name": "hycode",
+	"version": "0.5.26",
+	"description": "HyCode - 以 pi-coding-agent 为框架的轻量级终端编码助手，Claude Code 的开源替代；基于 pi-tui 的全屏聊天式终端界面",
+	"type": "module",
+	"bin": {
+		"HyCode": "dist/cli.js",
+		"hycode": "dist/cli.js"
+	},
+	"main": "./dist/cli.js",
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsgo -p tsconfig.build.json",
+		"dev": "tsgo -p tsconfig.build.json && node dist/cli.js",
+		"start": "node dist/cli.js"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "file:../pi/packages/ai",
+		"@earendil-works/pi-coding-agent": "file:../pi/packages/coding-agent",
+		"@earendil-works/pi-tui": "file:../pi/packages/tui"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"@typescript/native-preview": "7.0.0-dev.20260120.1"
+	}
+}
