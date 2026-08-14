@@ -1601,13 +1601,20 @@ function reportError(session: AgentSession): void {
 
 type ModeName = "ask" | "plan" | "auto";
 
+const MODE_NAMES: readonly ModeName[] = ["ask", "plan", "auto"];
+const MODE_DESC: Record<ModeName, string> = {
+	ask: "无工具",
+	plan: "只读",
+	auto: "完整工具",
+};
+
 const REPL_HELP = `斜杠命令:
   /model [名称]          查看或切换模型（/model openai/gpt-4o）
   /models                高亮选择模型（↑/↓ 回车切换，Esc 取消）
   /models add            交互式添加模型/供应商
   /models remove <目标>   移除模型或供应商
   /models reset          清空所有已添加的模型
-  /mode [ask|plan|auto]  切换模式: ask（无工具）/ plan（只读）/ auto（完整工具）
+  /mode [ask|plan|auto]  切换模式（回车交互式选择）: ask（无工具）/ plan（只读）/ auto（完整工具）
   /thinking [等级]       思考等级: off / low / medium / high（回车交互式选择；LLM 不支持时自动 off）
   /settings              自定义底部状态栏显示项
   /session               查看当前会话信息
@@ -1661,7 +1668,7 @@ const SLASH_COMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "models add", description: "交互式添加模型/供应商" },
 	{ name: "models remove", description: "移除模型或供应商" },
 	{ name: "models reset", description: "清空所有已添加的模型" },
-	{ name: "mode", description: "切换模式 ask/plan/auto" },
+	{ name: "mode", description: "切换模式（回车交互式选择）" },
 	{ name: "thinking", description: "思考等级 off/low/medium/high（LLM 不支持时自动 off）" },
 	{ name: "settings", description: "自定义底部状态栏显示项" },
 	{ name: "session", description: "查看当前会话信息" },
@@ -2410,18 +2417,37 @@ async function runRepl(
 		updateStatus(); // 模型列表变化 → 状态栏联动（模型:未选择）
 	};
 
-	const setModeCommand = async (arg: string): Promise<void> => {
+	const setModeCommand = (arg: string): void => {
 		if (!arg) {
-			say(`当前模式: ${mode}（ask=无工具 / plan=只读 / auto=完整工具）`);
+			// 无参数：贴近输入框弹三档选择（ask/plan/auto），选择后映射 pi 底层（setActiveToolsByName）
+			const current = mode;
+			const items = MODE_NAMES.map((m) => ({
+				value: m,
+				label: m === current ? `${m}（当前）` : m,
+				description: MODE_DESC[m],
+			}));
+			const list = new SelectList(items, Math.min(items.length, 8), selectListTheme);
+			const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
+			list.onSelect = (item) => {
+				overlay.hide();
+				applyMode(item.value as ModeName);
+				say(`已切换模式: ${item.value}（${MODE_DESC[item.value as ModeName]}）`);
+				updateStatus();
+			};
+			list.onCancel = () => {
+				overlay.hide();
+				say("已取消。");
+			};
+			tui.requestRender();
 			return;
 		}
 		if (arg === "ask" || arg === "plan" || arg === "auto") {
 			applyMode(arg);
-			say(`已切换模式: ${arg}`);
+			say(`已切换模式: ${arg}（${MODE_DESC[arg]}）`);
 			updateStatus();
 			return;
 		}
-		say(`未知模式 "${arg}"，可用: ask / plan / auto。`);
+		say(`未知模式 "${arg}"，可用: ${MODE_NAMES.join(" / ")}。`);
 	};
 
 	/** 应用思考等级并反馈实际生效值（底层按模型能力 clamp，展示真实等级而非请求值） */
@@ -2645,7 +2671,7 @@ async function runRepl(
 				return true;
 			}
 			case "/mode":
-				await setModeCommand(arg);
+				setModeCommand(arg);
 				return true;
 			case "/thinking":
 				setThinkingCommand(arg);
