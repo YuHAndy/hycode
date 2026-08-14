@@ -32,7 +32,7 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { Credential, Model } from "@earendil-works/pi-ai";
+import type { Credential, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
 	Container,
 	CURSOR_MARKER,
@@ -56,6 +56,7 @@ import {
 	type AutocompleteSuggestions,
 	type Component,
 	type OverlayHandle,
+	type OverlayOptions,
 	type SelectListTheme,
 	type SettingItem,
 	type SlashCommand,
@@ -72,7 +73,7 @@ import {
 interface CliOptions {
 	prompt?: string;
 	model?: string; // "provider/model" 或仅 "model"，必须是已添加的模型
-	thinkingLevel?: "off" | "low" | "medium" | "high";
+	thinkingLevel?: ModelThinkingLevel;
 	tools?: string[]; // 工具白名单
 	readonlyTools?: boolean;
 	noTools?: boolean;
@@ -103,13 +104,16 @@ interface ConfiguredProvider {
 /** 底部状态栏可显示的项 */
 type FooterItem = "mode" | "model" | "context" | "cwd" | "thinking" | "cache";
 
+/** 用户可选思考等级（映射 pi 底层同名字段；LLM 不支持思考时自动落回 off） */
+const THINKING_LEVELS_ALL: readonly ModelThinkingLevel[] = ["off", "low", "medium", "high"];
+
 const FOOTER_ITEMS: ReadonlyArray<{ key: FooterItem; label: string }> = [
 	{ key: "mode", label: "当前模式（ask/plan/auto）" },
 	{ key: "model", label: "当前模型（provider/id）" },
 	{ key: "context", label: "上下文占用百分比" },
 	{ key: "cache", label: "提示词缓存命中率" },
 	{ key: "cwd", label: "工作目录" },
-	{ key: "thinking", label: "思考级别（off/low/medium/high）" },
+	{ key: "thinking", label: "思考等级（off/low/medium/high）" },
 ];
 
 const DEFAULT_FOOTER: FooterItem[] = ["mode", "model", "context"];
@@ -166,7 +170,7 @@ const HELP_TEXT = `HyCode - 以 pi-coding-agent 为框架的轻量级终端编�
 
 选项:
   -m, --model <名称>      指定模型，格式 provider/model 或仅 model（须已添加）
-  -t, --thinking <级别>   思考级别: off | low | medium | high（默认 medium）
+  -t, --thinking <等级>   思考等级: off | low | medium | high（默认 medium；LLM 不支持时自动 off）
       --tools <列表>      逗号分隔的工具白名单，如 read,bash,edit,write,grep,find,ls
       --readonly          只读模式（仅 read/grep/find/ls，不启用 bash/edit/write）
       --no-tools          禁用全部工具（纯对话）
@@ -420,12 +424,16 @@ function createKeypressAdapter(stdin: NodeJS.ReadStream, stdout: NodeJS.WriteStr
 }
 
 /** REPL 模式（/models add 等）：基于 pi-tui 的 overlay 对话框（贴近输入框定位，Esc 可取消） */
-function createTuiPromptAdapter(tui: TUI, selectListTheme: SelectListTheme): PromptAdapter {
+function createTuiPromptAdapter(
+	tui: TUI,
+	selectListTheme: SelectListTheme,
+	editorHeight: () => number,
+): PromptAdapter {
 	const askText = (prompt: string): Promise<string | undefined> =>
 		new Promise((resolve) => {
 			const input = new Input();
 			const dialog = new PromptDialog(prompt, input);
-			const overlay = tui.showOverlay(dialog, INPUT_OVERLAY_OPTIONS);
+			const overlay = tui.showOverlay(dialog, inputOverlayOptions(tui, editorHeight()));
 			dialog.onCancel = () => {
 				overlay.hide();
 				resolve(undefined); // Esc 取消
@@ -441,7 +449,7 @@ function createTuiPromptAdapter(tui: TUI, selectListTheme: SelectListTheme): Pro
 		new Promise((resolve) => {
 			const input = new MaskedInput(); // 掩码显示为 ***
 			const dialog = new PromptDialog(prompt, input);
-			const overlay = tui.showOverlay(dialog, INPUT_OVERLAY_OPTIONS);
+			const overlay = tui.showOverlay(dialog, inputOverlayOptions(tui, editorHeight()));
 			dialog.onCancel = () => {
 				overlay.hide();
 				resolve(undefined); // Esc 取消
@@ -460,7 +468,7 @@ function createTuiPromptAdapter(tui: TUI, selectListTheme: SelectListTheme): Pro
 				items.length,
 				selectListTheme,
 			);
-			const overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+			const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 			list.onSelect = (item) => {
 				overlay.hide();
 				resolve(items.indexOf(item.value));
@@ -705,15 +713,38 @@ class ToolEntry implements Component {
 	}
 }
 
-/** 输入框相关的 overlay 统一定位：贴近输入框（底部左对齐），而非居中 */
-const INPUT_OVERLAY_OPTIONS = {
+/** 输入框相关 overlay 的基础定位参数（贴近输入框上方，而非终端底部） */
+const INPUT_OVERLAY_BASE = {
 	anchor: "bottom-left" as const,
 	offsetX: 1,
-	offsetY: -1,
 	width: "45%" as const,
 	minWidth: 30,
 	maxHeight: "60%" as const,
 };
+
+/**
+ * 输入框相关 overlay 定位：列表底边紧贴输入框顶边上一行（靠近命令行，而非终端底部）。
+ * 终端顺沿模式：输入框是文档最后一个子组件，文档不满一屏时输入框不在终端底部，
+ * 需按输入框实际屏幕位置计算；全屏模式：状态栏（1 行）垫底，输入框在其上方。
+ */
+function inputOverlayOptions(tui: TUI, editorHeight: number): OverlayOptions {
+	const width = tui.terminal.columns;
+	const height = tui.terminal.rows;
+	let editorTop: number;
+	if (isViewportTUI(tui)) {
+		// 全屏：状态栏占最后 1 行，输入框直接在其上方
+		editorTop = height - 1 - editorHeight;
+	} else {
+		// 终端顺沿：输入框是文档最后一个子组件；文档高度 = 已渲染总行数
+		const docHeight = tui.render(width).length;
+		const viewportTop = Math.max(0, docHeight - height);
+		editorTop = docHeight - editorHeight - viewportTop; // 输入框顶边所在屏幕行
+	}
+	editorTop = Math.max(0, editorTop);
+	// 列表底边 = 输入框顶边上一行；底边锚点（height-1）加上 offsetY
+	const offsetY = editorTop - height;
+	return { ...INPUT_OVERLAY_BASE, offsetY };
+}
 
 // ---------------------------------------------------------------------------
 // 宠物（buddy）系统：终端角落的动画小伙伴，/buddy 召唤与选择（后期可加多个）
@@ -1292,7 +1323,7 @@ function parseArgs(argv: string[]): CliOptions {
 			case "-t":
 			case "--thinking": {
 				const v = next();
-				if (!v || !["off", "low", "medium", "high"].includes(v)) {
+				if (!v || !THINKING_LEVELS_ALL.includes(v as ModelThinkingLevel)) {
 					throw new Error("--thinking 参数必须是 off | low | medium | high");
 				}
 				opts.thinkingLevel = v as CliOptions["thinkingLevel"];
@@ -1577,7 +1608,7 @@ const REPL_HELP = `斜杠命令:
   /models remove <目标>   移除模型或供应商
   /models reset          清空所有已添加的模型
   /mode [ask|plan|auto]  切换模式: ask（无工具）/ plan（只读）/ auto（完整工具）
-  /thinking [级别]       思考级别: off / low / medium / high
+  /thinking [等级]       思考等级: off / low / medium / high（回车交互式选择；LLM 不支持时自动 off）
   /settings              自定义底部状态栏显示项
   /session               查看当前会话信息
   /new                   开始新会话
@@ -1631,7 +1662,7 @@ const SLASH_COMMANDS: Array<{ name: string; description: string }> = [
 	{ name: "models remove", description: "移除模型或供应商" },
 	{ name: "models reset", description: "清空所有已添加的模型" },
 	{ name: "mode", description: "切换模式 ask/plan/auto" },
-	{ name: "thinking", description: "思考级别 off/low/medium/high" },
+	{ name: "thinking", description: "思考等级 off/low/medium/high（LLM 不支持时自动 off）" },
 	{ name: "settings", description: "自定义底部状态栏显示项" },
 	{ name: "session", description: "查看当前会话信息" },
 	{ name: "new", description: "开始新会话" },
@@ -1798,6 +1829,8 @@ async function runRepl(
 		selectList: selectListTheme,
 	});
 	editor.setAutocompleteProvider(new SlashCommandProvider(SLASH_COMMANDS));
+	/** 输入框当前渲染高度（overlay 定位用；随换行动态变化） */
+	const editorHeight = (): number => editor.render(terminal.columns).length;
 
 	// 工具/思考活动区（全屏=右侧面板，终端顺沿=对话框上方；各恒一行滚动，Ctrl+T 展开完整历史）
 	const toolLog = new Container();
@@ -1854,7 +1887,7 @@ async function runRepl(
 		const footer = config.settings.footer;
 		if (footer.includes("mode")) parts.push(`模式:${mode}`);
 		if (footer.includes("model")) parts.push(`模型:${modelLabel()}`);
-		if (footer.includes("thinking")) parts.push(`思考:${session.thinkingLevel}`);
+		if (footer.includes("thinking")) parts.push(`思考等级:${session.thinkingLevel}`);
 		if (footer.includes("context")) {
 			const window = session.model?.contextWindow ?? 0;
 			if (window > 0) {
@@ -1967,6 +2000,10 @@ async function runRepl(
 				// 整个用户回合（含工具轮次与排队消息）结束才收尾；自动重试时保留目标
 				if (!event.willRetry) finalizeTarget();
 				break;
+			case "thinking_level_changed":
+				// 底层思考等级变化（/thinking 命令或模型切换触发）→ 刷新状态栏
+				updateStatus();
+				break;
 		}
 	};
 	let unsubscribe = session.subscribe(onSessionEvent);
@@ -2066,7 +2103,7 @@ async function runRepl(
 		}));
 		const list = new SelectList(items, Math.min(items.length, 14), selectListTheme);
 		// 定位在输入框上方（紧跟 @ 的位置），而非屏幕中央
-		const overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+		const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 		atBrowserOpen = true;
 		list.onSelect = (item) => {
 			if (item.label.endsWith("/")) {
@@ -2112,7 +2149,7 @@ async function runRepl(
 	const showShortcuts = (): void => {
 		if (shortcutOverlay) return;
 		const panel = new Text(SHORTCUTS, 1, 1);
-		shortcutOverlay = tui.showOverlay(panel, { ...INPUT_OVERLAY_OPTIONS, nonCapturing: true });
+		shortcutOverlay = tui.showOverlay(panel, { ...inputOverlayOptions(tui, editorHeight()), nonCapturing: true });
 		tui.requestRender();
 	};
 	const hideShortcuts = (): void => {
@@ -2152,7 +2189,7 @@ async function runRepl(
 	};
 
 	// ---- 命令 ----
-	const tuiAsk = createTuiPromptAdapter(tui, selectListTheme);
+	const tuiAsk = createTuiPromptAdapter(tui, selectListTheme, editorHeight);
 
 	const switchModel = async (arg: string): Promise<void> => {
 		let targetProvider: string | undefined;
@@ -2241,7 +2278,7 @@ async function runRepl(
 			Math.min(BUDDIES.length, 8),
 			selectListTheme,
 		);
-		const overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+		const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 		list.onSelect = (item) => {
 			overlay.hide();
 			const spec = BUDDIES.find((b) => b.id === item.value);
@@ -2291,7 +2328,7 @@ async function runRepl(
 			Math.min(items.length, 12),
 			selectListTheme,
 		);
-		const overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+		const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 		list.onSelect = (item) => {
 			overlay.hide();
 			void switchModel(item.value);
@@ -2387,19 +2424,46 @@ async function runRepl(
 		say(`未知模式 "${arg}"，可用: ask / plan / auto。`);
 	};
 
-	const setThinkingCommand = (arg: string): void => {
-		const levels = ["off", "low", "medium", "high"];
-		if (!arg) {
-			say(`当前思考级别: ${session.thinkingLevel}（off/low/medium/high）`);
-			return;
+	/** 应用思考等级并反馈实际生效值（底层按模型能力 clamp，展示真实等级而非请求值） */
+	const applyThinkingLevel = (level: ModelThinkingLevel): void => {
+		const available = session.getAvailableThinkingLevels();
+		session.setThinkingLevel(level);
+		const effective = session.thinkingLevel;
+		if (effective !== level) {
+			say(`思考等级已设为 ${level}，但当前模型仅支持: ${available.join(" / ")}，实际生效: ${effective}。`);
+		} else {
+			say(`思考等级已切换: ${effective}。`);
 		}
-		if (!levels.includes(arg)) {
-			say(`未知级别 "${arg}"，可用: ${levels.join(" / ")}。`);
-			return;
-		}
-		session.setThinkingLevel(arg as "off" | "low" | "medium" | "high");
-		say(`已切换思考级别: ${arg}`);
 		updateStatus();
+	};
+
+	const setThinkingCommand = (arg: string): void => {
+		if (!arg) {
+			// 无参数：固定四档列表（off/low/medium/high），映射 pi 底层；
+			// LLM 不支持思考时自动落回 off（setThinkingLevel 内部 clamp）
+			const current = session.thinkingLevel;
+			const items = THINKING_LEVELS_ALL.map((l) => ({
+				value: l,
+				label: l === current ? `${l}（当前）` : l,
+			}));
+			const list = new SelectList(items, Math.min(items.length, 8), selectListTheme);
+			const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
+			list.onSelect = (item) => {
+				overlay.hide();
+				applyThinkingLevel(item.value as ModelThinkingLevel);
+			};
+			list.onCancel = () => {
+				overlay.hide();
+				say("已取消。");
+			};
+			tui.requestRender();
+			return;
+		}
+		if (!THINKING_LEVELS_ALL.includes(arg as ModelThinkingLevel)) {
+			say(`未知等级 "${arg}"，可用: ${THINKING_LEVELS_ALL.join(" / ")}。`);
+			return;
+		}
+		applyThinkingLevel(arg as ModelThinkingLevel);
 	};
 
 	const editSettings = (): void => {
@@ -2428,7 +2492,7 @@ async function runRepl(
 				updateStatus();
 			},
 		);
-		overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+		overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 		tui.requestRender();
 	};
 
@@ -2469,7 +2533,7 @@ async function runRepl(
 			Math.min(files.length, 12),
 			selectListTheme,
 		);
-		const overlay = tui.showOverlay(list, INPUT_OVERLAY_OPTIONS);
+		const overlay = tui.showOverlay(list, inputOverlayOptions(tui, editorHeight()));
 		list.onSelect = async (item) => {
 			overlay.hide();
 			try {
